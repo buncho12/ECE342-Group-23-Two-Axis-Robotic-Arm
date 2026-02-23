@@ -109,23 +109,38 @@ void loop() {
       float x = readAxis(line, 'X');
       float y = readAxis(line, 'Y');
 
+
+      Serial.print("pos x: ");
+      Serial.print(x);
+      Serial.print("pos y: ");
+      Serial.print(y);
+      Serial.println(";");
+      
+
       if (!isnan(x) && !isnan(y)) {
 
         float angle1_1, angle2_1, deltaAngle1, deltaAngle2;
         long step1, step2;
 
+        // ---- IK (radians) ----
         float r2 = x*x + y*y;
         float r  = sqrt(r2);
 
-        // ---- IK (radians) ----
-        // NOTE: this is ONE common SCARA form (elbow-down-ish). You may need +/- depending on your geometry.
-        float c1 = clamp1((L1*L1 + r2 - L2*L2) / (2.0*L1*r));
-        float c2 = clamp1((L1*L1 + L2*L2 - r2) / (2.0*L1*L2));
+        // 防止 acos 输入超出 [-1,1] 变 NaN
+        float c1 = (L1*L1 + r2 - L2*L2) / (2.0*L1*r);
+        c1 = clamp1(c1);
 
-        angle1_1 = atan2(-x, y) - acos(c1);
+        float c2 = (L1*L1 + L2*L2 - r2) / (2.0*L1*L2);
+        c2 = clamp1(c2);
+
+        
+        angle1_1 = atan2(y, x) - acos(c1);
         angle2_1 = acos(c2);
-
-        Serial.println(String("angle1: ") + String(angle1_1, 6) + "  angle2: " + String(angle2_1, 6) + ";");
+        Serial.print("angle1: ");
+        Serial.print(angle1_1*180/PI);
+        Serial.print("  angle2: ");
+        Serial.print(angle2_1*180/PI);
+        Serial.println(" (in deg!);");
 
         // ---- delta (radians) ----
         deltaAngle1 = angle1_1 - angle1_0;
