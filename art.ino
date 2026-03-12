@@ -14,39 +14,83 @@ const float L1 = 100.0;   // arm1 length (mm)
 const float L2 = 100.0;   // arm2 length (mm)
 
 // ----- Motor Specs -----
-const float STEPS_PER_REV = 200.0;   // 1.8° NEMA16
-const float MICROSTEP = 16.0;        // change if needed
-const float GEAR_RATIO1 = 1;
-const float GEAR_RATIO2 = 1;
-
-float steps_per_degree = (STEPS_PER_REV * MICROSTEP) / 360.0;
+// ----- Motor Specs -----
+const float STEP_ANGLE_DEG = 1.8;
 
 // -----------------------------
-// Current State Tracking
+// Current State Tracking (deg)
 // -----------------------------
-float current_theta1_deg = 0.0;
-float current_theta2_deg = 0.0;
+float oldA1 = 0.0;
+float oldA2 = 0.0;
 
+// -----------------------------
+// Helpers
+// -----------------------------
+float readAxis(const String& s, char axis) {
+  int i = s.indexOf(axis);
+  if (i < 0) return NAN;
 
+  int j = i + 1;
+  while (j < (int)s.length() && s[j] != ' ' && s[j] != '\r' && s[j] != '\n') {
+    j++;
+  }
+  return s.substring(i + 1, j).toFloat();
+}
+
+float clamp1(float v) {
+  if (v > 1.0) return 1.0;
+  if (v < -1.0) return -1.0;
+  return v;
+}
+
+float radToDeg(float rad) {
+  return rad * 180.0 / PI;
+}
+
+unsigned int feedToDelayUs(float feed) {
+  if (isnan(feed) || feed <= 0) return 800;
+
+  // bigger F => smaller delay => faster motion
+  float d = 200000.0 / feed;
+
+  if (d < 200) d = 200;     // fastest allowed
+  if (d > 3000) d = 3000;   // slowest allowed
+
+  return (unsigned int)d;
+}
+
+// -----------------------------
+// Sync motor motion
+// -----------------------------
 void moveMotorsSync(long steps1, long steps2, unsigned int usDelay) {
-  // set dir
-  digitalWrite(M1_DIR, steps1 >= 0 ? HIGH : LOW);
-  digitalWrite(M2_DIR, steps2 >= 0 ? HIGH : LOW);
+  // your direction convention:
+  // step >= 0 -> LOW
+  // step < 0  -> HIGH
+  digitalWrite(M1_DIR, steps1 >= 0 ? LOW : HIGH);
+  digitalWrite(M2_DIR, steps2 >= 0 ? LOW : HIGH);
 
   long a1 = labs(steps1);
   long a2 = labs(steps2);
 
   long maxSteps = max(a1, a2);
-  long err1 = 0, err2 = 0;
+  long err1 = 0;
+  long err2 = 0;
 
   for (long i = 0; i < maxSteps; i++) {
-    bool pulse1 = false, pulse2 = false;
+    bool pulse1 = false;
+    bool pulse2 = false;
 
     err1 += a1;
-    if (err1 >= maxSteps) { err1 -= maxSteps; pulse1 = true; }
+    if (err1 >= maxSteps) {
+      err1 -= maxSteps;
+      pulse1 = true;
+    }
 
     err2 += a2;
-    if (err2 >= maxSteps) { err2 -= maxSteps; pulse2 = true; }
+    if (err2 >= maxSteps) {
+      err2 -= maxSteps;
+      pulse2 = true;
+    }
 
     if (pulse1) digitalWrite(M1_STEP, HIGH);
     if (pulse2) digitalWrite(M2_STEP, HIGH);
@@ -65,121 +109,118 @@ void setup() {
   pinMode(M1_STEP, OUTPUT);
   pinMode(M2_DIR, OUTPUT);
   pinMode(M2_STEP, OUTPUT);
-}
 
-void moveMotor(int dirPin, int stepPin, long steps) {
-
-  digitalWrite(dirPin, steps >= 0 ? HIGH : LOW);
-  steps = abs(steps);
-
-  for (long i = 0; i < steps; i++) {
-    digitalWrite(stepPin, HIGH);
-    delayMicroseconds(800);   // controls speed
-    digitalWrite(stepPin, LOW);
-    delayMicroseconds(800);
-  }
-}
-
-float angle1_0 = 0, angle2_0 = 0;
-
-float readAxis(const String& s, char axis) {
-  int i = s.indexOf(axis);
-  if (i < 0) return NAN;
-  int j = i + 1;
-  while (j < (int)s.length() && s[j] != ' ' && s[j] != '\r' && s[j] != '\n') j++;
-  return s.substring(i + 1, j).toFloat();
-}
-
-float clamp1(float v) {
-  if (v > 1.0) return 1.0;
-  if (v < -1.0) return -1.0;
-  return v;
+  digitalWrite(M1_DIR, LOW);
+  digitalWrite(M1_STEP, LOW);
+  digitalWrite(M2_DIR, LOW);
+  digitalWrite(M2_STEP, LOW);
 }
 
 void loop() {
+  if (!Serial.available()) return;
 
-  if (Serial.available()) {
+  String line = Serial.readStringUntil('\n');
+  line.trim();
+  if (line.length() == 0) return;
 
-    String line = Serial.readStringUntil('\n');
-    line.trim();
-    if (line.length() == 0) return;
+  // ---------------------------
+  // Motion commands
+  // ---------------------------
+  if (line.startsWith("G0") || line.startsWith("G1")) {
+    float x = readAxis(line, 'X');
+    float y = readAxis(line, 'Y');
+    float feed = readAxis(line, 'F');
 
-    if (line.startsWith("G0") || line.startsWith("G1")) {
-
-      float x = readAxis(line, 'X');
-      float y = readAxis(line, 'Y');
-
-
-      Serial.print("pos x: ");
-      Serial.print(x);
-      Serial.print("pos y: ");
-      Serial.print(y);
-      Serial.println(";");
-      
-
-      if (!isnan(x) && !isnan(y)) {
-
-        float angle1_1, angle2_1, deltaAngle1, deltaAngle2;
-        long step1, step2;
-
-        // ---- IK (radians) ----
-        float r2 = x*x + y*y;
-        float r  = sqrt(r2);
-
-        // 防止 acos 输入超出 [-1,1] 变 NaN
-        float c1 = (L1*L1 + r2 - L2*L2) / (2.0*L1*r);
-        c1 = clamp1(c1);
-
-        float c2 = (L1*L1 + L2*L2 - r2) / (2.0*L1*L2);
-        c2 = clamp1(c2);
-
-        
-        angle1_1 = atan2(y, x) - acos(c1);
-        angle2_1 = acos(c2);
-        Serial.print("angle1: ");
-        Serial.print(angle1_1*180/PI);
-        Serial.print("  angle2: ");
-        Serial.print(angle2_1*180/PI);
-        Serial.println(" (in deg!);");
-
-        // ---- delta (radians) ----
-        deltaAngle1 = angle1_1 - angle1_0;
-        deltaAngle2 = angle2_1 - angle2_0;
-
-        // ---- radians -> steps ----
-        step1 = (long)(deltaAngle1 / (2.0*PI) * STEPS_PER_REV * MICROSTEP * GEAR_RATIO1);
-        step2 = (long)(deltaAngle2 / (2.0*PI) * STEPS_PER_REV * MICROSTEP * GEAR_RATIO2);
-        Serial.print("step1: "); Serial.print(step1);
-        Serial.print("  step2: "); Serial.println(step2);
-
-        // save angles
-        angle1_0 = angle1_1;
-        angle2_0 = angle2_1;
-
-        // i dont have motor connected to MC
-        moveMotorsSync(step1, step2, 800);
-
-        Serial.println("ok");
-      }
-      else {
-        Serial.println("error");
-      }
+    if (isnan(feed)) {
+      if (line.startsWith("G0")) feed = 2000;  // default faster travel move
+      else feed = 800;                         // default drawing move
     }
 
-    // ---------------------------
-    // Non-motion commands
-    // ---------------------------
-    else if (line.startsWith("G21") || line.startsWith("G90") || line.startsWith("M2")) {
+    unsigned int usDelay = feedToDelayUs(feed);
 
-      // Just acknowledge them
-      Serial.println("ok");
-    }
+    Serial.print("pos x: ");
+    Serial.print(x);
+    Serial.print("  pos y: ");
+    Serial.println(y);
+    Serial.print("feed: ");
+    Serial.print(feed);
+    Serial.print("  usDelay: ");
+    Serial.println(usDelay);
 
-    // ---------------------------
-    // Unknown command
-    // ---------------------------
-    else {
+    if (isnan(x) || isnan(y)) {
       Serial.println("error");
+      return;
     }
+
+    float r = sqrt(x * x + y * y);
+
+    // basic reach / divide-by-zero protection
+    if (r == 0.0) {
+      Serial.println("error");
+      return;
+    }
+
+    // -------- A2 from your picture --------
+    float c2 = (x * x + y * y - L1 * L1 - L2 * L2) / (2.0 * L1 * L2);
+    c2 = clamp1(c2);
+    float newA2_rad = acos(c2);
+
+    // -------- A1 from your picture --------
+    float t1 = (-x) / r;
+    t1 = clamp1(t1);
+
+    float t2 = (L1 + L2 * cos(newA2_rad)) / r;
+    t2 = clamp1(t2);
+
+    float newA1_rad = acos(t1) - acos(t2);
+
+    // -------- convert everything to DEG --------
+    float newA1 = radToDeg(newA1_rad);
+    float newA2 = radToDeg(newA2_rad);
+
+    Serial.print("newA1 (deg): ");
+    Serial.print(newA1);
+    Serial.print("  newA2 (deg): ");
+    Serial.println(newA2);
+
+    // -------- delta in DEG --------
+    float deltaA1 = newA1 - oldA1;
+    float deltaA2 = newA2 - oldA2;
+
+    Serial.print("deltaA1 (deg): ");
+    Serial.print(deltaA1);
+    Serial.print("  deltaA2 (deg): ");
+    Serial.println(deltaA2);
+
+    // -------- DEG -> steps --------
+    long step1 = lround(deltaA1 / STEP_ANGLE_DEG);
+    long step2 = lround(deltaA2 / STEP_ANGLE_DEG);
+
+    Serial.print("step1: ");
+    Serial.print(step1);
+    Serial.print("  step2: ");
+    Serial.println(step2);
+
+    // move motors
+    moveMotorsSync(step1, step2, usDelay);
+
+    // update old angles AFTER move
+    oldA1 = newA1;
+    oldA2 = newA2;
+
+    Serial.println("ok_motors");
+  }
+  // ---------------------------
+  // Non-motion commands
+  // ---------------------------
+  else if (line.startsWith("G21") || line.startsWith("G90") || line.startsWith("M2")) {
+    Serial.println("ok_gcode");
+  }
+
+  // ---------------------------
+  // Unknown command
+  // ---------------------------
+  else {
+    Serial.println("error");
   }
 }
