@@ -4,8 +4,6 @@ import serial.tools.list_ports
 import time
 import math
 
-from letters import LETTERS, LETTER_SPACING
-
 BAUD = 115200
 ser = None
 
@@ -21,9 +19,11 @@ def list_ports():
 # Serial Controls
 # ------------------------
 ui.label('SCARA Block 1 (NiceGUI)').classes('text-2xl font-bold')
+
 feed_input = ui.slider(min=200, max=2000, step=100, value=800).props('label-always')
 ui.label().bind_text_from(feed_input, 'value', lambda v: f'Feed Speed: {int(v)}')
-ui.label('Select a serial port, connect, and enter text to draw.')
+
+ui.label('Select a serial port, connect, and choose a drawing function.')
 
 with ui.row().classes('items-center gap-4'):
     port_select = ui.select(options=list_ports(), label='Serial Port').classes('w-96')
@@ -46,8 +46,12 @@ def connect():
         print('FAIL: No port selected')
         return
     try:
-        ser = serial.Serial(port_select.value, BAUD, timeout=0.01)
-        time.sleep(2)  # Arduino resets when serial opens
+        ser = serial.Serial(port_select.value, BAUD, timeout=0.2)
+        time.sleep(2)
+
+        ser.reset_input_buffer()
+        ser.reset_output_buffer()
+
         status.text = 'Connected'
         status.props('color=green')
         ui.notify(f'Connected to {port_select.value}', color='green')
@@ -78,97 +82,9 @@ with ui.row().classes('gap-2'):
 
 
 # ------------------------
-# Text Input (ER-7)
+# G-code generators
 # ------------------------
-ui.separator()
-ui.label('Text Writing Mode').classes('text-lg font-semibold')
-
-typed_text = ui.textarea(
-    label='Enter text to draw',
-    placeholder='Example: ABC',
-).classes('w-full')
-
-ui.separator()
-ui.label('Line Drawing Mode').classes('text-lg font-semibold')
-
-with ui.row().classes('gap-4 items-center'):
-    start_x_input = ui.number(label='Start X', value=10, format='%.2f').classes('w-32')
-    start_y_input = ui.number(label='Start Y', value=10, format='%.2f').classes('w-32')
-    end_x_input = ui.number(label='End X', value=50, format='%.2f').classes('w-32')
-    end_y_input = ui.number(label='End Y', value=50, format='%.2f').classes('w-32')
-
-# ------------------------
-# Text -> G-code (mm, absolute)
-# ------------------------
-def text_to_gcode(text: str, start_x=10, start_y=10, segment_len=2.0, feed=800):
-    gcode = [
-        "G21",  # mm
-        "G90",  # absolute
-    ]
-
-    x_offset = start_x
-    current_x = None
-    current_y = None
-
-    for ch in text.upper():
-        if ch == " ":
-            x_offset += LETTER_SPACING
-            current_x = None
-            current_y = None
-            continue
-
-        if ch not in LETTERS:
-            print(f"SKIP: Unsupported letter {ch}")
-            continue
-
-        for cmd in LETTERS[ch]:
-            if cmd[0] == "G0":
-                _, x, y = cmd
-                tx = x_offset + x
-                ty = start_y + y
-
-                gcode.append(f"G0 X{tx:.2f} Y{ty:.2f}")
-                current_x = tx
-                current_y = ty
-
-            else:  # G1
-                _, x, y, f = cmd
-                tx = x_offset + x
-                ty = start_y + y
-
-                # 如果前面没有当前位置，就直接补一条 G1
-                if current_x is None or current_y is None:
-                    gcode.append(f"G1 X{tx:.2f} Y{ty:.2f} F{int(feed)}")
-                    current_x = tx
-                    current_y = ty
-                    continue
-
-                dx = tx - current_x
-                dy = ty - current_y
-                dist = math.hypot(dx, dy)
-
-                if dist == 0:
-                    gcode.append(f"G1 X{tx:.2f} Y{ty:.2f} F{int(feed)}")
-                else:
-                    n = max(1, math.ceil(dist / segment_len))
-                    for i in range(1, n + 1):
-                        t = i / n
-                        xi = current_x + dx * t
-                        yi = current_y + dy * t
-                        gcode.append(f"G1 X{xi:.2f} Y{yi:.2f} F{int(feed)}")
-
-                current_x = tx
-                current_y = ty
-
-        x_offset += LETTER_SPACING
-        current_x = None
-        current_y = None
-
-    gcode.append("M2")
-    return gcode
-
-
-def line_to_gcode(x1: float, y1: float, x2: float, y2: float, feed: float = 800, segment_len: float = 2.0):
+def line_to_gcode(x1: float, y1: float, x2: float, y2: float, feed: float = 800, segment_len: float = 30.0):
     dx = x2 - x1
     dy = y2 - y1
     dist = math.hypot(dx, dy)
@@ -192,6 +108,47 @@ def line_to_gcode(x1: float, y1: float, x2: float, y2: float, feed: float = 800,
     gcode.append("M2")
     return gcode
 
+
+def square_to_gcode(x: float, y: float, side: float, feed: float = 800, segment_len: float = 30.0):
+    if side <= 0:
+        return []
+
+    points = [
+        (x, y),
+        (x + side, y),
+        (x + side, y + side),
+        (x, y + side),
+        (x, y),
+    ]
+
+    gcode = [
+        "G21",
+        "G90",
+        f"G0 X{x:.2f} Y{y:.2f}",
+    ]
+
+    for i in range(len(points) - 1):
+        x1, y1 = points[i]
+        x2, y2 = points[i + 1]
+
+        dx = x2 - x1
+        dy = y2 - y1
+        dist = math.hypot(dx, dy)
+
+        if dist == 0:
+            gcode.append(f"G1 X{x2:.2f} Y{y2:.2f} F{int(feed)}")
+        else:
+            n = max(1, math.ceil(dist / segment_len))
+            for j in range(1, n + 1):
+                t = j / n
+                xi = x1 + dx * t
+                yi = y1 + dy * t
+                gcode.append(f"G1 X{xi:.2f} Y{yi:.2f} F{int(feed)}")
+
+    gcode.append("M2")
+    return gcode
+
+
 # ------------------------
 # Send G-code to MC
 # ------------------------
@@ -212,12 +169,11 @@ def send_gcode_lines(lines):
             ser.write((line + "\n").encode("ascii"))
             print(">>", line)
 
-            # TRUE HANDSHAKE
             while True:
                 resp = ser.readline().decode("utf-8", errors="ignore").strip()
 
                 if not resp:
-                    continue  # wait again
+                    continue
 
                 print("<<", resp)
 
@@ -235,35 +191,72 @@ def send_gcode_lines(lines):
     ui.notify('G-code sent', color='green')
 
 
-def send_text_as_gcode():
-    text = typed_text.value or ""
-    if not text.strip():
-        ui.notify('No text entered', color='red')
-        print('FAIL: No text')
-        return
-    feed = float(feed_input.value if feed_input.value is not None else 800)
-    lines = text_to_gcode(text, feed=feed)
-    print('SUCCESS: Generated G-code for:', text)
-    send_gcode_lines(lines)
+# ------------------------
+# GUI: Draw Line
+# ------------------------
+ui.separator()
+ui.label('Draw Line').classes('text-lg font-semibold')
 
-def send_line_as_gcode():
+with ui.row().classes('gap-4 items-center'):
+    line_x1 = ui.number(label='Start X', value=10, format='%.2f').classes('w-32')
+    line_y1 = ui.number(label='Start Y', value=30, format='%.2f').classes('w-32')
+    line_x2 = ui.number(label='End X', value=50, format='%.2f').classes('w-32')
+    line_y2 = ui.number(label='End Y', value=30, format='%.2f').classes('w-32')
+
+
+def draw_line():
     try:
-        x1 = float(start_x_input.value if start_x_input.value is not None else 0)
-        y1 = float(start_y_input.value if start_y_input.value is not None else 0)
-        x2 = float(end_x_input.value if end_x_input.value is not None else 0)
-        y2 = float(end_y_input.value if end_y_input.value is not None else 0)
+        x1 = float(line_x1.value if line_x1.value is not None else 0)
+        y1 = float(line_y1.value if line_y1.value is not None else 0)
+        x2 = float(line_x2.value if line_x2.value is not None else 0)
+        y2 = float(line_y2.value if line_y2.value is not None else 0)
         feed = float(feed_input.value if feed_input.value is not None else 800)
 
-        lines = line_to_gcode(x1, y1, x2, y2, feed)
-        print(f'SUCCESS: Generated line G-code: ({x1}, {y1}) -> ({x2}, {y2}), F={feed}')
+        lines = line_to_gcode(x1, y1, x2, y2, feed=feed)
+        print(f'SUCCESS: Line G-code generated: ({x1}, {y1}) -> ({x2}, {y2})')
         send_gcode_lines(lines)
 
     except Exception as e:
         ui.notify('Invalid line input', color='red')
         print('FAIL: Invalid line input:', e)
 
-with ui.row().classes('gap-2'):
-    ui.button('Send Text as G-code', on_click=send_text_as_gcode).props('color=secondary')
-    ui.button('Send Line', on_click=send_line_as_gcode).props('color=accent')
+
+ui.button('Draw Line', on_click=draw_line).props('color=secondary')
+
+
+# ------------------------
+# GUI: Draw Square
+# ------------------------
+ui.separator()
+ui.label('Draw Square').classes('text-lg font-semibold')
+
+with ui.row().classes('gap-4 items-center'):
+    square_x = ui.number(label='Start X', value=10, format='%.2f').classes('w-32')
+    square_y = ui.number(label='Start Y', value=30, format='%.2f').classes('w-32')
+    square_side = ui.number(label='Side Length', value=20, format='%.2f').classes('w-32')
+
+
+def draw_square():
+    try:
+        x = float(square_x.value if square_x.value is not None else 0)
+        y = float(square_y.value if square_y.value is not None else 0)
+        side = float(square_side.value if square_side.value is not None else 0)
+        feed = float(feed_input.value if feed_input.value is not None else 800)
+
+        if side <= 0:
+            ui.notify('Side length must be > 0', color='red')
+            print('FAIL: Invalid square side length')
+            return
+
+        lines = square_to_gcode(x, y, side, feed=feed)
+        print(f'SUCCESS: Square G-code generated: start=({x}, {y}), side={side}')
+        send_gcode_lines(lines)
+
+    except Exception as e:
+        ui.notify('Invalid square input', color='red')
+        print('FAIL: Invalid square input:', e)
+
+
+ui.button('Draw Square', on_click=draw_square).props('color=accent')
 
 ui.run()
