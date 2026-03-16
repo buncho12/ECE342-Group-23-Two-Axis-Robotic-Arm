@@ -9,8 +9,25 @@ ser = None
 
 
 # ------------------------
+# SCARA Geometry
+# ------------------------
+
+
+L1 = 19.0
+L2 = 16.0
+
+STEPS_PER_REV = 200
+MICROSTEP = 16
+
+STEPS_PER_DEG = (STEPS_PER_REV * MICROSTEP) / 360.0
+
+prev_theta1 = 0.0
+prev_theta2 = 0.0
+
+# ------------------------
 # Serial utilities
 # ------------------------
+
 def list_ports():
     return [p.device for p in serial.tools.list_ports.comports()]
 
@@ -18,6 +35,7 @@ def list_ports():
 # ------------------------
 # Serial Controls
 # ------------------------
+
 ui.label('SCARA Block 1 (NiceGUI)').classes('text-2xl font-bold')
 
 feed_input = ui.slider(min=200, max=2000, step=100, value=800).props('label-always')
@@ -36,17 +54,18 @@ def refresh():
     if ports and not port_select.value:
         port_select.value = ports[0]
     ui.notify(f'Found {len(ports)} port(s)')
-    print('SUCCESS: Ports refreshed:', ports)
 
 
 def connect():
     global ser
+
     if not port_select.value:
         ui.notify('Select a port first', color='red')
-        print('FAIL: No port selected')
         return
+
     try:
-        ser = serial.Serial(port_select.value, BAUD, timeout=0.2)
+        ser = serial.Serial(port_select.value, BAUD, timeout=0.5)
+
         time.sleep(2)
 
         ser.reset_input_buffer()
@@ -54,25 +73,26 @@ def connect():
 
         status.text = 'Connected'
         status.props('color=green')
+
         ui.notify(f'Connected to {port_select.value}', color='green')
-        print(f'SUCCESS: Connected to {port_select.value} @ {BAUD}')
+
     except Exception as e:
         ui.notify('Connection failed', color='red')
-        print('FAIL: Connection error:', e)
+        print(e)
 
 
 def disconnect():
     global ser
-    try:
-        if ser:
-            ser.close()
-        ser = None
-        status.text = 'Disconnected'
-        status.props('color=red')
-        ui.notify('Disconnected')
-        print('SUCCESS: Disconnected')
-    except Exception as e:
-        print('FAIL: Disconnect error:', e)
+
+    if ser:
+        ser.close()
+
+    ser = None
+
+    status.text = 'Disconnected'
+    status.props('color=red')
+
+    ui.notify('Disconnected')
 
 
 with ui.row().classes('gap-2'):
@@ -82,181 +102,200 @@ with ui.row().classes('gap-2'):
 
 
 # ------------------------
-# G-code generators
+# SCARA Inverse Kinematics
 # ------------------------
-def line_to_gcode(x1: float, y1: float, x2: float, y2: float, feed: float = 800, segment_len: float = 30.0):
-    dx = x2 - x1
-    dy = y2 - y1
-    dist = math.hypot(dx, dy)
 
-    gcode = [
-        "G21",
-        "G90",
-        f"G0 X{x1:.2f} Y{y1:.2f}",
-    ]
+def scara_ik(x, y):
 
-    if dist == 0:
-        gcode.append(f"G1 X{x2:.2f} Y{y2:.2f} F{int(feed)}")
-    else:
-        n = max(1, math.ceil(dist / segment_len))
-        for i in range(1, n + 1):
-            t = i / n
-            xi = x1 + dx * t
-            yi = y1 + dy * t
-            gcode.append(f"G1 X{xi:.2f} Y{yi:.2f} F{int(feed)}")
+    r2 = x*x + y*y
 
-    gcode.append("M2")
-    return gcode
+    cos_t2 = (r2 - L1*L1 - L2*L2) / (2 * L1 * L2)
+    cos_t2 = max(-1, min(1, cos_t2))
 
+    theta2 = math.acos(cos_t2)
 
-def square_to_gcode(x: float, y: float, side: float, feed: float = 800, segment_len: float = 30.0):
-    if side <= 0:
-        return []
+    k1 = L1 + L2 * math.cos(theta2)
+    k2 = L2 * math.sin(theta2)
 
-    points = [
-        (x, y),
-        (x + side, y),
-        (x + side, y + side),
-        (x, y + side),
-        (x, y),
-    ]
+    theta1 = math.atan2(y, x) - math.atan2(k2, k1)
 
-    gcode = [
-        "G21",
-        "G90",
-        f"G0 X{x:.2f} Y{y:.2f}",
-    ]
-
-    for i in range(len(points) - 1):
-        x1, y1 = points[i]
-        x2, y2 = points[i + 1]
-
-        dx = x2 - x1
-        dy = y2 - y1
-        dist = math.hypot(dx, dy)
-
-        if dist == 0:
-            gcode.append(f"G1 X{x2:.2f} Y{y2:.2f} F{int(feed)}")
-        else:
-            n = max(1, math.ceil(dist / segment_len))
-            for j in range(1, n + 1):
-                t = j / n
-                xi = x1 + dx * t
-                yi = y1 + dy * t
-                gcode.append(f"G1 X{xi:.2f} Y{yi:.2f} F{int(feed)}")
-
-    gcode.append("M2")
-    return gcode
+    return math.degrees(theta1), math.degrees(theta2)
 
 
 # ------------------------
-# Send G-code to MC
+# Angle → Motor Steps
 # ------------------------
-def send_gcode_lines(lines):
+
+def angles_to_steps(theta1, theta2):
+
+    global prev_theta1
+    global prev_theta2
+
+    d1 = theta1 - prev_theta1
+    d2 = theta2 - prev_theta2
+
+    steps1 = int(d1 * STEPS_PER_DEG)
+    steps2 = int(d2 * STEPS_PER_DEG)
+
+    prev_theta1 = theta1
+    prev_theta2 = theta2
+
+    return steps1, steps2
+
+
+# ------------------------
+# Send Motor Command
+# ------------------------
+
+def send_motor_steps(s1, s2, delay):
+
     global ser
+
     if not ser:
         ui.notify('Not connected to Arduino', color='red')
         return
 
-    print('=== START SEND ===')
+    cmd = f"M {s1} {s2} {int(delay)}\n"
 
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
+    ser.write(cmd.encode())
 
-        try:
-            ser.write((line + "\n").encode("ascii"))
-            print(">>", line)
+    print(">>", cmd.strip())
 
-            while True:
-                resp = ser.readline().decode("utf-8", errors="ignore").strip()
+    while True:
 
-                if not resp:
-                    continue
+        resp = ser.readline().decode(errors="ignore").strip()
 
-                print("<<", resp)
+        if resp:
 
-                if resp == "ok_gcode" or resp == "ok_motors":
-                    break
-                elif resp == "error":
-                    ui.notify("Arduino reported error", color="red")
-                    return
+            print("<<", resp)
 
-        except Exception as e:
-            print("FAIL:", e)
-            return
-
-    print('=== DONE ===')
-    ui.notify('G-code sent', color='green')
-
+            if resp == "ok_motors":
+                time.sleep(0.01);
+                break
+            if resp == "error":
+                ui.notify("Arduino reported error", color="red")
+                break
 
 # ------------------------
-# GUI: Draw Line
+# Draw Line
 # ------------------------
+
 ui.separator()
 ui.label('Draw Line').classes('text-lg font-semibold')
 
 with ui.row().classes('gap-4 items-center'):
-    line_x1 = ui.number(label='Start X', value=10, format='%.2f').classes('w-32')
-    line_y1 = ui.number(label='Start Y', value=30, format='%.2f').classes('w-32')
-    line_x2 = ui.number(label='End X', value=50, format='%.2f').classes('w-32')
-    line_y2 = ui.number(label='End Y', value=30, format='%.2f').classes('w-32')
+    line_x1 = ui.number(label='Start X', value=-35, format='%.2f').classes('w-32')
+    line_y1 = ui.number(label='Start Y', value=0, format='%.2f').classes('w-32')
+    line_x2 = ui.number(label='End X', value=20, format='%.2f').classes('w-32')
+    line_y2 = ui.number(label='End Y', value=20, format='%.2f').classes('w-32')
 
 
 def draw_line():
-    try:
-        x1 = float(line_x1.value if line_x1.value is not None else 0)
-        y1 = float(line_y1.value if line_y1.value is not None else 0)
-        x2 = float(line_x2.value if line_x2.value is not None else 0)
-        y2 = float(line_y2.value if line_y2.value is not None else 0)
-        feed = float(feed_input.value if feed_input.value is not None else 800)
 
-        lines = line_to_gcode(x1, y1, x2, y2, feed=feed)
-        print(f'SUCCESS: Line G-code generated: ({x1}, {y1}) -> ({x2}, {y2})')
-        send_gcode_lines(lines)
+    try:
+
+        x1 = float(line_x1.value)
+        y1 = float(line_y1.value)
+
+        x2 = float(line_x2.value)
+        y2 = float(line_y2.value)
+
+        feed = float(feed_input.value)
+
+        dx = x2 - x1
+        dy = y2 - y1
+
+        dist = math.hypot(dx, dy)
+
+        segments = max(10, int(dist * 5))
+
+        for i in range(segments + 1):
+
+            t = i / segments
+
+            x = x1 + dx * t
+            y = y1 + dy * t
+
+            theta1, theta2 = scara_ik(x, y)
+
+            s1, s2 = angles_to_steps(theta1, theta2)
+
+            if s1 != 0 or s2 != 0:
+                send_motor_steps(s1, s2, feed)
+
+        ui.notify("Line drawn", color="green")
 
     except Exception as e:
-        ui.notify('Invalid line input', color='red')
-        print('FAIL: Invalid line input:', e)
+        print(e)
+        ui.notify("Invalid input", color="red")
 
 
 ui.button('Draw Line', on_click=draw_line).props('color=secondary')
 
 
 # ------------------------
-# GUI: Draw Square
+# Draw Square
 # ------------------------
+
 ui.separator()
 ui.label('Draw Square').classes('text-lg font-semibold')
 
 with ui.row().classes('gap-4 items-center'):
-    square_x = ui.number(label='Start X', value=10, format='%.2f').classes('w-32')
-    square_y = ui.number(label='Start Y', value=30, format='%.2f').classes('w-32')
-    square_side = ui.number(label='Side Length', value=20, format='%.2f').classes('w-32')
+    square_x = ui.number(label='Start X', value=-5, format='%.2f').classes('w-32')
+    square_y = ui.number(label='Start Y', value=5, format='%.2f').classes('w-32')
+    square_side = ui.number(label='Side Length', value=5, format='%.2f').classes('w-32')
 
 
 def draw_square():
+
     try:
-        x = float(square_x.value if square_x.value is not None else 0)
-        y = float(square_y.value if square_y.value is not None else 0)
-        side = float(square_side.value if square_side.value is not None else 0)
-        feed = float(feed_input.value if feed_input.value is not None else 800)
 
-        if side <= 0:
-            ui.notify('Side length must be > 0', color='red')
-            print('FAIL: Invalid square side length')
-            return
+        start_x = float(square_x.value)
+        start_y = float(square_y.value)
+        side = float(square_side.value)
+        feed = float(feed_input.value)
 
-        lines = square_to_gcode(x, y, side, feed=feed)
-        print(f'SUCCESS: Square G-code generated: start=({x}, {y}), side={side}')
-        send_gcode_lines(lines)
+        points = [
+            (start_x, start_y),
+            (start_x + side, start_y),
+            (start_x + side, start_y + side),
+            (start_x, start_y + side),
+            (start_x, start_y)
+        ]
+
+        for i in range(len(points) - 1):
+
+            x1, y1 = points[i]
+            x2, y2 = points[i + 1]
+
+            dx = x2 - x1
+            dy = y2 - y1
+
+            dist = math.hypot(dx, dy)
+
+            # higher resolution
+            segments = max(40, int(dist * 20))
+
+            for j in range(segments + 1):
+
+                t = j / segments
+
+                px = x1 + dx * t
+                py = y1 + dy * t
+
+                theta1, theta2 = scara_ik(px, py)
+
+                s1, s2 = angles_to_steps(theta1, theta2)
+
+                if s1 != 0 or s2 != 0:
+                    send_motor_steps(s1, s2, feed)
+
+        ui.notify("Square drawn", color="green")
 
     except Exception as e:
-        ui.notify('Invalid square input', color='red')
-        print('FAIL: Invalid square input:', e)
-
-
+        print(e)
+        ui.notify("Invalid square input", color="red")
 ui.button('Draw Square', on_click=draw_square).props('color=accent')
+
 
 ui.run()
